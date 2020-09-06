@@ -1,0 +1,702 @@
+---
+title: "NYC Taxi Fare Analysis Prediction"
+author: "Claire Zhang"
+date: "09/03/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load libraries
+```{r message=FALSE}
+library("formattable")
+library("tidyverse")
+library("ggplot2")
+library("ggmap")
+library("lubridate")
+library("caret")
+library("ranger")
+library("randomForest")
+library("ggridges")
+library("rpart")
+library("rattle")
+library("rpart.plot")
+library("RColorBrewer")
+library("MASS")
+library("tree")
+library("dplyr")
+library("quantreg")
+library("ggmap")
+library("ggmap")
+library("MLmetrics")
+
+```
+
+# Project Goals
+The first goal of this project is to identify any trends and patterns in New York City taxi fares. If we are able to discover any significant findings from the data, we can make recommendations to taxi drivers on how to boost their daily earnings. Second goal is to see if we are can build regression models to predict taxi fares based on a number of factors (time, date, pickup and dropoff locations and etc.)
+
+# Hypothesis 
+NYC Taxi fares are affective by pick-up and drop-off locations, passenger count, trip distance, pick-up and drop-off time during the day, day of the week, and whether it is an airport trip. We will exam this hypothesis through data exploratory analysis and building linear model 
+
+# Load Data
+First, loading the datasets of NYC Yellow Taxi Trips for Januray, April, July, October 2019 
+The datasets were sourced from nyc.gov website **[link]( https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page)** (or copy-paste the url into your browser : https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
+Data Dictionary can be found here [Link](https://www1.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_yellow.pdf)
+
+```{r}
+#loading the database of NYC Yellow Taxi Trip for Januray, April, July, October 2018 and combine them into a single data frame.
+yel_jan <- read.csv("yellow_tripdata_2019-01.csv")
+yel_apl <- read.csv("yellow_tripdata_2019-04.csv")
+yel_jul <- read.csv("yellow_tripdata_2019-07.csv")
+yel_oct <- read.csv("yellow_tripdata_2019-10.csv")
+all <- rbind(yel_jan, yel_apl, yel_jul, yel_oct)
+```
+
+# Data Overview
+
+A quick overview of the dataset: 
+* Check dataset size  (noted the dataset has 28.6M rows an 18 columns)
+```{r}
+dim(all)
+```
+
+* Preview dataframe
+```{r}
+head(all)
+```
+
+* Inspect columns in the dataset
+```{r}
+str(all)
+```
+
+**Random sample a subset of data**
+Considering data size and running speed, I randomly sampled 1 millions rows of data from the all dataset for EDA (Data Exploratory Analysis)
+```{r}
+set.seed(123)
+index <- sample(x = 1:nrow(all), size= 1000000)
+```
+
+Retain the following columns will be revelant to taxi fare
+```{r}
+sampled <- all[index , c("tpep_pickup_datetime", "tpep_dropoff_datetime", "passenger_count", "trip_distance", "PULocationID", "DOLocationID","payment_type", "total_amount")]
+
+#Save the sampled dataset
+write.csv(sampled, file="NYC Taxi Fare Data Sample.csv", row.names=FALSE)
+```
+
+Load back the sampled smalldataset
+```{r}
+nyc_taxi <- read.csv("NYC Taxi Fare Data Sample.csv")
+```
+
+I am going to use the sample dataset to perform Data Exploratoy Analysis and build prediction model to test my hypothesis above.
+
+Also loading the Taxi Zone Lookup Table from the same nyc.gov webpage **[link]( https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page)**. 
+```{r}
+#Loading the taxi zone lookup table, which we will be used for locations referrence 
+taxi_zone <- read.csv("taxi_zone_lookup.csv")
+```
+
+After reviewing the summary of taxi_zone table, founded that there are 2 LocationID (264 and 265) recorded as unknown borough. We're  excluding data rows with these two locationID in the **all** table later.
+```{r}
+unknown_loc <- taxi_zone[taxi_zone$Borough == "Unknown", ]$LocationID
+```
+
+* Data Summary (check min, max, missing values, any noise data)
+
+Obtain a quick understanding of the dataset. Here are a few questions that I found : 
++ There is negative values in total_amount and the xax value is 36090.30(extreme values)
++ zero passenger or passengers greater than 6
++ NA values in 2 columns passenger_count and payment_type (same number of NAs in both columns)
+```{r}
+summary(nyc_taxi)
+```
+
+Inspect missing data. Noted the missing values in passenger_count and payment_type are in the same rows
+
+```{r}
+apply(nyc_taxi, 2, function(x) {sum(is.na(x))})
+```
+
+Remove rows where there is missing values
+```{r}
+nyc_taxi <- nyc_taxi %>% drop_na()
+```
+
+```{r}
+dim(nyc_taxi)
+```
+
+
+# Data Cleaning
+
+### Remove unusual data or outliers 
+Here I performed data cleaning in the following:
+1. Remove taxi trips for which the pickup or drop-off location was unknown (filtering out the two unknown locationID)
+
+2. Remove rows with zero passenger, zero trip_distance, zero or negative fare amount, zero or negative tolls amount, zero or negative total amount.
+
+3. Filter for taxi trips with payment type as credict card or cash, excluding trips that are no-charging, dispute, unknown, or voided. (payment type: 1 = credit card, 2 = cash, 3 = No charge, 4 = Dispute, 5 = Unknown, 6 = Voided trip, from *Data Dictionary – Yellow Taxi Trip Records* [link](https://www1.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_yellow.pdf))
+
+```{r}
+nyc_taxi <- nyc_taxi %>% 
+  filter((! PULocationID %in% unknown_loc) & (!DOLocationID %in% unknown_loc)) %>%
+  filter(passenger_count != 0 & total_amount > 0  & trip_distance != 0 ) %>% 
+  filter(payment_type == 1 | payment_type == 2)
+```
+
+Check dataset summary again after removing outliers. Confirm that all values (min, max, quantiles) are more reasonable and we can move on to feature engineerings
+```{r}
+summary(nyc_taxi)
+```
+
+# Feature engineering 
+
+Since location ID is not easily interpretable. We're going to convert location ID to location by name. Perform a "Vlookup" to identify at which borough the taxi trip began using the taxi_zone table
+```{r}
+nyc_taxi <- nyc_taxi %>% 
+  left_join(taxi_zone[, c(1,2,3)], by = c("PULocationID" =  "LocationID"))
+
+nyc_taxi <- nyc_taxi %>% 
+  rename("puBorough" = "Borough", "puZone" = "Zone")    #puBorough = pick-up borough
+```
+
+Performed another "vlookup" to identify at which Borough the taxi trip ended
+```{r}
+nyc_taxi <- nyc_taxi %>% 
+  left_join(taxi_zone[, c(1,2,3)], by = c("DOLocationID" =  "LocationID"))
+
+nyc_taxi <- nyc_taxi %>% 
+  rename("doBorough" = "Borough", "doZone" = "Zone")      #doBorough = drop-off borough
+```
+
+```{r}
+head(nyc_taxi)
+```
+
+Create New Features to classify at what time during the day and on which day during the week the taxi trip is taken
+* pickup hour
+* pickup day of the week
+* pickup day of the month
+```{r}
+nyc_taxi <- nyc_taxi %>% 
+  mutate( pk_hour = hour(tpep_pickup_datetime),
+          pk_wday = wday(tpep_pickup_datetime,  label = TRUE),
+          pk_month = month(tpep_pickup_datetime, label = TRUE))
+```
+
+To change pk_hour and passenger count as factor variables
+```{r}
+nyc_taxi$pk_hour <- as.factor(nyc_taxi$pk_hour)
+nyc_taxi$passenger_count <- as.factor(nyc_taxi$passenger_count) 
+```
+
+To classify whether the taxi trips were going to or coming from airports. We first identify locationID for airports from the taxi zone table.
+```{r}
+airportID <- taxi_zone[str_detect(taxi_zone$Zone, "Airport"), ]$LocationID
+airportID <- airportID[! is.na(airportID)]
+airportID
+```
+
+
+Create a new column named airports_trip for which TRUE stands for airport trips.
+```{r}
+nyc_taxi <- nyc_taxi %>% 
+  mutate(airports_trip = (PULocationID %in% airportID | DOLocationID  %in% airportID ))
+```
+
+# Data Exploratory Analysis
+```{r}
+head(nyc_taxi)
+```
+
+### Histogram of Taxi Fares 
+The distribution of taxi fares is highly right-skewed, which means the dataset contains lots of outliers.
+```{r}
+ggplot(nyc_taxi, aes(x = total_amount)) +
+  geom_histogram(fill = "blue", bins =  50) +
+  ggtitle("Histogram of NYC Taxi Fares") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+While taking logarithm to transform the target variable can help conforming to normality, I found it hard to interprect the plots. I am more opt for excluding outliers in the plot.
+
+### Histogram of Taxi Fares (first 99.99 percentile)
+To "zoon in" the distribution plot, I filtered the dataset for taxi fares (total amount) below the 99.99th quantile ($134.8). This can help us to have a better understanding of the distribution of the majority(99.99%) of data in our sample. I also highlight the median taxi fare in the plot.
+```{r}
+total_amount_99 <-quantile(nyc_taxi$total_amount, .9999)
+total_amount_99
+
+median_fare <- nyc_taxi %>% 
+  summarise(median_fare = median(total_amount))
+median_fare
+
+nyc_taxi %>% 
+  filter(total_amount < total_amount_99) %>% 
+  ggplot(aes(x = total_amount)) +
+  geom_histogram(color = "white", fill = "blue", bins =  50) +
+  geom_vline(xintercept = median_fare$median_fare,linetype="dashed", color = "black", size=1) +
+  annotate(geom="text", x=30, y=140000, label="median = 11.8", color="black") +
+  ggtitle("Histogram of NYC Taxi Fares(median = 11.8)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**I am applying the first 99.99th quantile filter on total_amount(taxi fare) for the following data exploratory analysis as a way to elimiate noise(outliers), which will help us identify the general trends in taxi fares easier.**
+
+### Taxi fares by different pick-up boroughs
+Next I plotted the density of taxi fares by different pick-up boroughs(see below). This plot shows that there are differences in taxi fares between different pickup locations. Thought the median taxi fares of Newark is the highest among all boroughs, the distribution of EWR-picked-up taxi fares is the most widely spread out. Taxi fares of Staten-Island-pick-up follows the similar patterns as EWR.
+
+The taxi fares of the other four boroughs (Queens, Manhattan, Brooklyn and Bronx) follow approximately normal distributions. Taxi trips startting from Queens have a median taxi fares about 2 times larger than from Manhattan, Brooklyn and Bronx.
+
+I also computed the number of taxi trips taken at each boroughs and the percentage over total. It's worthwhile to be aware that Manhattan by itself accounts for 92.3% of all the taxi trips in New York City, followed by Queens 6.3% and Brooklyn 1.23%. The rest of three boroughs has very small amount of taxi trips.
+```{r}
+pu_median <- nyc_taxi %>% 
+  filter(total_amount < total_amount_99) %>% 
+  group_by(puBorough) %>% 
+  summarize(median = median(total_amount), num_trips = n()) %>% 
+  mutate(percentage = round(num_trips/sum(num_trips), digits=4))
+pu_median
+```
+
+```{r}
+# Density Plot : Taxi fares by different pick-up boroughs
+nyc_taxi %>%  
+  filter(total_amount < total_amount_99) %>% 
+  ggplot(aes(x =total_amount, y = puBorough, fill = puBorough)) +
+  geom_density_ridges(scale = 1, quantile_lines = TRUE, quantiles = 2) +
+  ggtitle("Density and Median Taxi Fares by Pick-up Boroughs") +
+  geom_text(data = pu_median, aes(x= median, y= puBorough, label= median), 
+            position=position_nudge(y=-0.1), colour="black", size=3.5) +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+### Taxi fares by different pick-up zones
+Then, I want to how taxi fares differe by different zones. Computer the average and median of taxi fares, count of taxi trips by pick-up boroughs and further by pick-up zones.
+```{r}
+puZone_summary <- nyc_taxi %>%
+  group_by(puBorough, puZone) %>% 
+  summarise(avg_taxi_fare_puzone = mean(total_amount),median_taxi_fare_puzone = median(total_amount), num_trips = n()) %>% 
+  arrange(desc(avg_taxi_fare_puzone)) 
+
+```
+
+```{r}
+head(puZone_summary,20)
+```
+The summary table shows that the majority of zones with the highest average taxi fares actually have very small number of trips. This indicates that those zones with high taxi fares are not necessarily the most profitable choice or the go-to places for taxi drivers when considering the volumn of demand. 
+Since the dataset is about New York Yellow Cap Taxi Trips, pick-ups from Newark Airport is of very small amount, while drop-off at Newark Airport has high volumn(presented below). Given the distance to Newark Airport from NYC, a New York taxi driver is more likely to pick up a passenger within the NYC and drop off her at Newark Airport. 
+Queens is a very promising choice as it accounts for 13 out of 20 top zones on this rank. The median taxi fare of Queens-pick-up is $45.36. 
+
+
+Then I filtered for zones with more than 100 trips to focus on highly taxi-wanted areas, and sorted the summary table by average taxi fare from highest to the lowest.
+```{r}
+puZone_summary <- puZone_summary %>%
+  filter(num_trips > 100) %>% 
+  arrange(desc(avg_taxi_fare_puzone)) 
+```
+
+We can see that, among the top 20 zones by average taxi fares, half of them are located within Queens where passengers are very likely to take an expensive taxi trip, not to mention the taxi trips that people takes from JFK and LaGuardia airports are also within Queens.
+Manhattan and Brooklyn are two other boroughs associated with high average taxi fares. 
+```{r}
+head(puZone_summary,20)
+```
+
+### Taxi fares by different drop-off boroughs
+Plot density ridges for a comparison in taxi fare distributions between different drop-off boroughs. As taxi driver are not likely to predict where the next passengers are going to until he picks up the passenger, this information is less useful in helping taxi drivers to boost their earnings.
+```{r}
+do_median <- nyc_taxi %>% 
+  filter(total_amount < total_amount_99) %>% 
+  group_by(doBorough) %>% 
+  summarize(do_median = median(total_amount))
+do_median
+
+nyc_taxi %>%  
+  filter(total_amount < total_amount_99) %>% 
+  ggplot(aes(x =total_amount, y = doBorough, fill = doBorough)) +
+  geom_density_ridges(scale = 1, quantile_lines = TRUE, quantiles = 2) +
+  geom_text(data = do_median, aes(x= do_median, y= doBorough, label= do_median), 
+            position=position_nudge(y=-0.1), colour="black", size=3.5) +
+  ggtitle("Density of Taxi Fares by Different Drop-off Boroughs") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+```
+
+
+### Distribution of Taxi fares between airport taxi trips and non-airport trips
+
+Plot distributions of taxi fares between airport taxi trips and non-airport trips. Both the density and boxplot show that taxi rides travel to or from the airport cost higher than non-airport trips, which makes sense as the distance to airports are most likely longer than a within-city trip.
+With this information, I would suggest taxi drivers to take more airports trips by stopping for passengers with suitcases with them.
+
+```{r}
+nyc_taxi %>%  
+  filter(total_amount < total_amount_99) %>% 
+  ggplot(aes(x = total_amount, color = airports_trip)) +
+  geom_density() +
+  ggtitle("Density of Taxi Fares by Airport-trips or not") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+nyc_taxi %>% 
+  filter(total_amount < total_amount_99) %>% 
+  ggplot() +
+  geom_boxplot(aes(x=airports_trip, y=total_amount, fill = airports_trip)) +
+  ggtitle("Boxplot of total taxi fare by airport-trip or not ")+
+  theme(plot.title = element_text(size = 12, hjust = 0.5))
+
+```
+
+### Taxi Fares by Hours of the Day
+
+Plot the density of taxi fare by pick-up hour. It looks like there is very minimum difference in taxi fares between different hours of the day
+```{r}
+nyc_taxi %>% 
+  filter( total_amount < total_amount_99 ) %>% 
+  ggplot(aes(x=total_amount, color = pk_hour), alpha = 0.5) +
+  geom_density()+
+  ggtitle("Density of Taxi Fare by Pick-up Time") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5)) 
+```
+
+Computed the median taxi fares by hour of the day, sorted it in descending order and listed the top 10. Noted two things from the table:
+* The best time to work for taxi drivers are probably these 10 hours that I grouped into three time slots:3am to 5am(early morning), 4pm to 7pm(after work rush hour) and 10pm to 1am (late evening).
+* By arranging these top 10 hours by number of trips, the morning shift (4am to 6am) has highest average value but the lowest in demand.
+```{r}
+pkh <- nyc_taxi %>% 
+  group_by(pk_hour) %>% 
+  summarize(avg_pkh = round(mean(total_amount), 2), num_trips = n())
+
+pkh_top10 <- pkh  %>% 
+  arrange(desc(avg_pkh)) %>% 
+  top_n(wt = avg_pkh, n=10)
+
+pkh_top10 %>% 
+  arrange(desc(num_trips))
+```
+
+Given the observation above, I created a new variable called rush_hour to group 24 hours a day into 4 time-slot:Early Morning(4am-6am), Mid_Day(1pm-6pm), Midnight(10pm-1am),Regular Hour(any other time). This is one of techniques of feature engineering, Discretization, which is converting a continuous variable to a categorical variable by creating meaningful classes
+```{r}
+nyc_taxi <- nyc_taxi %>% 
+  mutate(rush_hour =as.factor(ifelse(pk_hour %in% c(22,23,0), "Midnight(9pm-2am)", 
+                                     ifelse(pk_hour %in% c(4,5), "Early Morning(3am-5am)", 
+                                            ifelse(pk_hour %in% c(13,14,15,16,17), "Mid_day(1pm-6pm)" , "Other Hours")))))
+
+rush_hr_median <- nyc_taxi %>% 
+  filter(total_amount < total_amount_99) %>% 
+  group_by(rush_hour) %>% 
+  summarize(median_rush_hr = round(median(total_amount), 2), avg_rush_hr = round(mean(total_amount), 2), num_trips = n())
+rush_hr_median
+```
+
+### Taxi fares by 4 pickup timeframe during the day
+Plot boxplots for taxi fares by four time frames.This graph shows that there is some advantage for taxi drivers to work during those three special time frames, early morning, mid_day and midnight than any other hours.
+
+```{r}
+nyc_taxi %>%
+  filter( total_amount < total_amount_99 ) %>%
+  ggplot(aes(y=total_amount, x= rush_hour, color = rush_hour)) +
+  geom_boxplot()+
+  stat_summary(fun.y=mean, colour="darkblue", geom="point", 
+               shape=18, size=3, show.legend =FALSE) + 
+  geom_text(data = rush_hr_median, aes(y= avg_rush_hr  , x= rush_hour, label= avg_rush_hr  ),
+            position=position_nudge(y = 3), colour="black", size=3.5) +
+  ggtitle("Boxplot of Taxi Fares by Pick-up Time Frame") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5)) 
+```
+
+### Taxi fares by days in a week
+Let's look at taxi fares by day of the week. According to this plot, we can see that Thursday, Friday and Monday are best days to work given they rank the highest both in average and mean taxi fares, while Saturday is worst day to work during a week.
+
+```{r}
+pk_wday_median <- nyc_taxi %>% 
+  filter(total_amount < total_amount_99) %>% 
+  group_by(pk_wday) %>% 
+  summarize(median_wday = round(median(total_amount), 2),avg_wday = round(mean(total_amount), 2), num_trips = n())
+pk_wday_median
+
+nyc_taxi %>%  
+  filter(total_amount < total_amount_99) %>% 
+  ggplot(aes(y =total_amount, x = pk_wday, color = pk_wday)) +
+  geom_boxplot() +
+  geom_text(data = pk_wday_median, aes(y= avg_wday, x= pk_wday, label= avg_wday), 
+            position=position_nudge(y= -3), colour="black", size=3.5) +
+  stat_summary(fun.y=mean, colour="darkblue", geom="point", 
+               shape=18, size=3, show.legend =FALSE) + 
+  ggtitle("Boxplots & Mean of Taxi Fares by pick-up day of the week") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5)) 
+```
+
+### Taxi fares by number of passengers
+I also want to see if passenger count affects the taxi fares. It seems there is little difference in taxi fare between taxi rides with different number of passengers. 
+
+```{r}
+
+nyc_taxi %>% 
+  filter(passenger_count %in% c(1:6)) %>% 
+  filter(total_amount <= total_amount_99) %>% 
+  group_by(passenger_count) %>% 
+  summarise(mean= mean(total_amount)) %>% 
+  ggplot(aes(y = mean, x=passenger_count, fill = passenger_count)) +
+  geom_bar(stat = "identity") +
+  ggtitle("Average Taxi Fares by Number of Passengers") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5)) 
+
+```
+
+
+# Dataset preparation
+
+Let's get ready for some modeling!
+
+Let's check datatype
+```{r}
+str(nyc_taxi)
+```
+
+
+Noted that pk_wday and pk_month are ordered factor variables. I converted them to unordered factor variables because there is no actual ranking between these classes.
+```{r}
+nyc_taxi$pk_wday <- factor(nyc_taxi$pk_wday, ordered = FALSE )
+nyc_taxi$pk_month <- factor(nyc_taxi$pk_month, ordered = FALSE)
+```
+
+standard scale the numerical variables trip_distance 
+```{r}
+nyc_taxi$trip_distance_scaled <- scale(nyc_taxi$trip_distance, center = TRUE, scale = TRUE)
+```
+
+### Downsize the dataset to 100,000 rows of data for modeling
+```{r}
+set.seed(123)
+index_2 <- sample(1:nrow(nyc_taxi), 120000)
+df_model <- nyc_taxi[index_2 , c("passenger_count", "trip_distance_scaled", "total_amount", "puBorough","doBorough", "pk_hour", "pk_wday", "airports_trip", "rush_hour") ]
+
+# save the dataset
+write.csv(df_model, file = "nyctaxi_df_for_model.csv")
+```
+
+### Train test split - create Train and Test set
+Split the dataset into training and test set
+```{r}
+# Re-load data
+df <- read.csv(file = "nyctaxi_df_for_model.csv")
+# 80/20 split for training and validation
+set.seed(12)
+shuffle <- sample(nrow(df))
+split <- round(nrow(df) * 0.8)
+shuffled <- df[shuffle, ]
+train <- shuffled[1 : split, ]
+test <-  shuffled[(split + 1) : nrow(df_model), ] 
+```
+
+Further split the training set to create a validation set 
+```{r}
+# 80/20 split for training and validation
+set.seed(12)
+shuffle <- sample(nrow(train))
+split <- round(nrow(train) * 0.8)
+shuffled <- train[shuffle, ]
+train_set <- train[1 : split, ]
+val <-  train[(split + 1) : nrow(train), ] 
+```
+
+```{r}
+head(train)
+```
+
+
+# Model Training and Evaluation
+
+### Baseline - Linear regression with all variables
+```{r}
+#train linear model 
+lm_model <- lm(total_amount ~ passenger_count + trip_distance_scaled + puBorough + doBorough + pk_wday + airports_trip + rush_hour, data = train_set)
+summary(lm_model)
+```
+What's the model summary telling us?
+* The Adjusted R-squared of the linear regression model is 0.8854, which means the model(independent variables) explains 88.54% of the variance in the data(target variable).
+* The p-value on the F-statistic is significantly less than 5%, indicating this linear model fits the dataset
+* Most of the coefficients of the linear are significant (using 5% threshold) except for passenger count, which has a p values higher than 5%.
+
+Let's check the goodness of fit of the linear model by predicting on validation set, and compute the RMSE, MAPE
+```{r}
+# predict on the validation set
+pred_val_lm <- predict(lm_model, val)
+
+# compute RMSE and MAPE of the prediction on validation set
+MAPE_val_lm <- MAPE(pred_val_lm , val$total_amount)
+RMSE_val_lm <- sqrt(MSE(pred_val_lm , val$total_amount))
+MAPE_val_lm
+RMSE_val_lm
+```
+
+Based on the result of first model, linear regression with all independent variables, not all the variables are significant. I am going apply step model on the linear model to see if any features we can drop.
+
+Run a step model to see if any of the variables could be dropped. Again, passenger count is the least important predicting variable here as dropping the passenger count variable leads to a very small decrease in AIC compared to the full model.
+```{r}
+step.model <- step(lm_model, direction = "both")
+summary(step.model)
+```
+
+### Second model: Linear Regression without passenger count
+Train linear regression without the passenger count variable. Noted this  modification does improve the model a little bit as it yields a slightly smaller RMSE.
+```{r}
+lm_model_v2 <- lm(total_amount ~ trip_distance_scaled + puBorough + doBorough + pk_wday + airports_trip + rush_hour, data = train_set)
+summary(lm_model_v2)
+
+```
+
+Check goodness of fit of second model
+```{r}
+# predict on the validation set
+pred_val_lm_2 <- predict(lm_model_v2, val)
+
+# compute RMSE and MAPE of the prediction on validation set
+MAPE_val_lm_2 <- MAPE(pred_val_lm_2 , val$total_amount)
+RMSE_val_lm_2 <- sqrt(MSE(pred_val_lm_2 , val$total_amount))
+MAPE_val_lm_2
+RMSE_val_lm_2
+```
+
+### Third model - Decision tree using rpart
+```{r}
+# decision tree using rpart
+tree <- rpart(total_amount ~ trip_distance_scaled + puBorough + doBorough + pk_wday + airports_trip + rush_hour,
+              data = train_set, method = "anova", control=rpart.control(minsplit=100) )
+
+```
+
+The decision tree model used two variables trip distance and drop-off locations to slipt the data, while the trip distance and airport-trip are ranks top 2 in terms of variable importance 
+```{r}
+fancyRpartPlot(tree)
+```
+
+Check feature importance
+```{r}
+printcp(tree)
+tree$variable.importance
+```
+
+While the decision tree model is easier to interprect, it's prediction on taxi fare of the test dataset is not as good as the linear regression model, as the decision tree model has a higher RMSE.
+```{r}
+# predict on the validation set
+pred_val_dt <- predict(tree, val)
+
+# compute RMSE and MAPE of the prediction on validation set
+MAPE_val_dt <- MAPE(pred_val_dt , val$total_amount)
+RMSE_val_dt <- sqrt(MSE(pred_val_dt , val$total_amount))
+MAPE_val_dt
+RMSE_val_dt
+```
+
+### The 4th model: random forest
+The random forest model shows that trip distance and drop-off location are most important variables 
+
+```{r}
+set.seed(123)
+rf_model <- randomForest(total_amount ~ trip_distance_scaled + puBorough + doBorough + pk_wday + airports_trip + rush_hour,
+                           data = train_set, importance = TRUE)
+saveRDS(rf_model, "nyctaxi_model_rf.rds")
+
+#rf_model <- readRDS("~/Folders/R/NYC_Taxi_Project/nyctaxi_model_rf.rds")
+```
+
+Model summary
+```{r}
+print(rf_model)
+```
+
+Check feature importance
+```{r}
+varImp(rf_model)
+varImpPlot(rf_model,type=1)
+```
+
+Take a look at how well the random forest model perform predictions on the test dataset. The RMSE of random forest model is lower than that of the decision tree model.
+```{r}
+# predict on the validation set
+pred_val_rf <- predict(rf_model, val)
+
+# compute RMSE and MAPE of the prediction on validation set
+MAPE_val_rf <- MAPE(pred_val_rf , val$total_amount)
+RMSE_val_rf <- sqrt(MSE(pred_val_rf , val$total_amount))
+MAPE_val_rf
+RMSE_val_rf
+```
+
+
+### The 5th model : random forest with cross-validation 
+```{r}
+rf_cv <- train(
+  total_amount ~ trip_distance_scaled + puBorough + doBorough + pk_wday + airports_trip + rush_hour,
+  train_set, method = "ranger", 
+  trControl = trainControl( method = "cv", number = 5, verboseIter = FALSE))
+
+saveRDS(rf_cv, "rf_cv_model.rds")
+#cv_model <- readRDS("~/Folders/R/NYC_Taxi_Project/model_cv.rds")
+```
+
+Check model summary
+```{r}
+print(rf_cv)
+print(rf_cv$finalModel)
+```
+
+Use the cross-validated random forest model to predict validation set and estimate the accuracy of the predictions. The random forest model with cross-validation resulting in the lowest RMSE score, so therefore it's the best model of 5 all models.
+```{r}
+# predict on the validation set
+pred_val_rfcv <- predict(rf_cv, val)
+
+# compute RMSE and MAPE of the prediction on validation set
+MAPE_val_rfcv <- MAPE(pred_val_rfcv , val$total_amount)
+RMSE_val_rfcv <- sqrt(MSE(pred_val_rfcv , val$total_amount))
+MAPE_val_rfcv
+RMSE_val_rfcv
+```
+
+A summary of all validation errors by all five models, and noted random forest model with cross validation has the lowest RSME and MAPE, and therefore it's the best model so far. 
+```{r}
+modelname <- c("linear model","linear modelv2", "decision tree","random forest","random forest with cv")
+modelRMSE <- c(RMSE_val_lm,  RMSE_val_lm_2, RMSE_val_dt , RMSE_val_rf , RMSE_val_rfcv)
+modelMAPE <- c(MAPE_val_lm,  MAPE_val_lm_2, MAPE_val_dt , MAPE_val_rf , MAPE_val_rfcv)
+val_error <- as.data.frame( cbind(modelname,modelRMSE , modelMAPE)  )
+colnames(val_error) <- c("Models", "RMSE","MAPE")
+val_error
+```
+
+
+### Prediction on test set
+Apply the best model(5th model, random forest with cv) to predict on test set
+```{r}
+# predict on the test set
+pred_test_rfcv <- predict(rf_cv, test)
+```
+
+```{r}
+# compute RMSE and MAPE of the prediction on validation set
+MAPE_test_rfcv <- MAPE(pred_test_rfcv , test$total_amount)
+RMSE_test_rfcv <- sqrt(MSE(pred_test_rfcv , test$total_amount))
+MAPE_test_rfcv
+RMSE_test_rfcv
+```
+
+### Conclusion
+Throughout data exploration, visualization and modeling, I found consistently trip distance is the most important factor for taxi fares, which makes sense as taxi fare is calculated using miles.
+Still, there are something that taxi drivers can do differently to increase earnings: taxi drivers can pay attention to factors like pick-up and drop-off locations, whether it's to/from the airports, time blocks during the day, and the day in the week.
+
+
+
+
+
+
+
+
+
+
+
+
+
