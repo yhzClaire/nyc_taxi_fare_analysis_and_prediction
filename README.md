@@ -1,7 +1,7 @@
 # nyc_taxi_fare_analysis_and_prediction
 Discover any trends or patterns in NYC taxi fare and build prediction models
 
-**[Click here to see this project](https://yhzclaire.github.io/nyc_taxi_fare_analysis_and_prediction/)**
+**[Click here to see this project](https://yzclaire.github.io/nyc_taxi_fare_analysis_and_prediction/)**
 
 Regression Models:
 + Linear Regression
